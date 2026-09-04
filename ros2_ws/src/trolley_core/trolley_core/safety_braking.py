@@ -1,20 +1,37 @@
-"""Three-zone LiDAR safety supervisor.
+"""Sectorized three-zone LiDAR safety supervisor.
 
 Sits between motion sources and the Arduino. It subscribes to a raw motion
 request and to /scan, then republishes a limited /cmd_vel that the base
-controller consumes:
+controller consumes.
 
-  CLEAR : pass the request through unchanged.
-  WARN  : pass through, but announce the state.
-  SLOW  : clamp |linear.x| to a slow ceiling (still allow turning).
-  STOP  : zero linear.x (rotation is still allowed so the operator can reorient).
+Instead of one blanket nearest-distance, the scan is split into four sectors in
+the CART frame - FRONT, REAR, LEFT, RIGHT - and the nearest obstacle in each is
+tracked. Linear motion is gated by the sector it drives into:
 
-Fail-safe: if scans go stale it holds STOP; if motion requests go stale it
-publishes zero. A cart-footprint box filters the LiDAR's self-hits.
+  - forward  (linear.x > 0) is limited by the FRONT sector.
+  - reverse  (linear.x < 0) is limited by the REAR sector.
+  - rotation (angular.z) is always allowed, so the operator can reorient.
 
-NOTE: the current Arduino firmware is bang-bang (any linear.x > 0 -> full
-DRIVE_SPEED), so the SLOW clamp only takes physical effect once the firmware
-accepts a speed value. STOP is fully enforced today (linear.x = 0 -> 'X').
+So a wall ahead blocks forward motion but still lets the cart back away, which a
+blanket STOP could not do. Each sector uses the same zones:
+
+  CLEAR : pass through.
+  WARN  : pass through, announce.
+  SLOW  : clamp |linear.x| to a slow ceiling.
+  STOP  : zero linear.x for that direction.
+
+Bearing: every LaserScan sample carries an angle, so the bearing is free. The
+beam angle, minus a mounting offset, is the obstacle's bearing in the cart frame
+(0 = ahead, +90 = left, -90 = right, 180 = behind). That angle picks the sector.
+
+Fail-safe: if scans go stale it holds STOP in every sector; if motion requests
+go stale it publishes zero. A cart-footprint box filters the LiDAR's self-hits.
+
+NOTE: firmware is bang-bang today, so the SLOW clamp only bites once the firmware
+accepts a speed value. STOP is fully enforced now (linear.x = 0 -> 'X').
+
+Rotation is not yet gated by the side sectors, so a close side obstacle while
+spinning in place is not caught. That is a later refinement.
 """
 
 import math
@@ -47,6 +64,9 @@ class SafetyBrakingNode(Node):
         self.declare_parameter('scan_timeout_s', 0.5)
         self.declare_parameter('command_timeout_s', 0.5)
         self.declare_parameter('publish_rate_hz', 20.0)
+        # Sectoring
+        self.declare_parameter('front_arc_deg', 90.0)     # width of FRONT and REAR arcs
+        self.declare_parameter('bearing_offset_deg', 0.0)  # lidar 0 -> cart forward
 
         g = lambda n: self.get_parameter(n).value
         self.stop_d = g('stop_distance_m')
@@ -58,8 +78,13 @@ class SafetyBrakingNode(Node):
         self.box = (g('cart_x_min'), g('cart_x_max'), g('cart_y_min'), g('cart_y_max'))
         self.scan_timeout = g('scan_timeout_s')
         self.cmd_timeout = g('command_timeout_s')
+        self.half_front = math.radians(float(g('front_arc_deg')) / 2.0)
+        self.bearing_offset = math.radians(float(g('bearing_offset_deg')))
 
+        self.sect = {'FRONT': float('inf'), 'REAR': float('inf'),
+                     'LEFT': float('inf'), 'RIGHT': float('inf')}
         self.min_dist = float('inf')
+        self.min_bearing = 0.0
         self.last_scan_time = None
         self.latest_request = None
         self.last_request_time = None
@@ -72,12 +97,36 @@ class SafetyBrakingNode(Node):
         self.create_timer(1.0 / float(g('publish_rate_hz')), self.on_timer)
 
         self.get_logger().info(
-            f"Safety supervisor active. zones stop<={self.stop_d} "
-            f"slow<={self.slow_d} warn<={self.warn_d} m")
+            f"Sectorized safety active. zones stop<={self.stop_d} "
+            f"slow<={self.slow_d} warn<={self.warn_d} m; "
+            f"front/rear arc {g('front_arc_deg')} deg")
+
+    @staticmethod
+    def _wrap(a):
+        # normalize to (-pi, pi]
+        return math.atan2(math.sin(a), math.cos(a))
+
+    def _sector(self, bearing):
+        if abs(bearing) <= self.half_front:
+            return 'FRONT'
+        if abs(bearing) >= math.pi - self.half_front:
+            return 'REAR'
+        return 'LEFT' if bearing > 0.0 else 'RIGHT'
+
+    def _zone(self, d):
+        if d <= self.stop_d:
+            return 'STOP'
+        if d <= self.slow_d:
+            return 'SLOW'
+        if d <= self.warn_d:
+            return 'WARN'
+        return 'CLEAR'
 
     def on_scan(self, msg):
         x_min, x_max, y_min, y_max = self.box
+        front = rear = left = right = float('inf')
         best = float('inf')
+        best_bearing = 0.0
         for i, r in enumerate(msg.ranges):
             if not (self.range_min < r < self.range_max):
                 continue
@@ -86,9 +135,22 @@ class SafetyBrakingNode(Node):
             y = r * math.sin(angle)
             if (x_min < x < x_max) and (y_min < y < y_max):
                 continue  # ignore the cart's own footprint
+            bearing = self._wrap(angle - self.bearing_offset)
+            sect = self._sector(bearing)
+            if sect == 'FRONT' and r < front:
+                front = r
+            elif sect == 'REAR' and r < rear:
+                rear = r
+            elif sect == 'LEFT' and r < left:
+                left = r
+            elif sect == 'RIGHT' and r < right:
+                right = r
             if r < best:
                 best = r
+                best_bearing = bearing
+        self.sect = {'FRONT': front, 'REAR': rear, 'LEFT': left, 'RIGHT': right}
         self.min_dist = best
+        self.min_bearing = best_bearing
         self.last_scan_time = self.get_clock().now()
 
     def on_request(self, msg):
@@ -100,46 +162,59 @@ class SafetyBrakingNode(Node):
             return True
         return (self.get_clock().now() - stamp).nanoseconds / 1e9 > timeout
 
-    def _zone(self, d):
-        if d <= self.stop_d:
-            return 'STOP'
-        if d <= self.slow_d:
-            return 'SLOW'
-        if d <= self.warn_d:
-            return 'WARN'
-        return 'CLEAR'
+    def _limit(self, linear, sector_dist):
+        # apply the zone for one direction; returns limited linear.x
+        z = self._zone(sector_dist)
+        if z == 'STOP':
+            return 0.0
+        if z == 'SLOW':
+            return max(-self.slow_max, min(self.slow_max, linear))
+        return linear
 
     def on_timer(self):
         scan_stale = self._stale(self.last_scan_time, self.scan_timeout)
-        d = self.min_dist
-        state = 'STOP' if scan_stale else self._zone(d)
+        if scan_stale:
+            front = rear = left = right = 0.0  # force STOP everywhere
+        else:
+            front, rear = self.sect['FRONT'], self.sect['REAR']
+            left, right = self.sect['LEFT'], self.sect['RIGHT']
 
         cmd = Twist()
         if self.latest_request is not None and not self._stale(self.last_request_time, self.cmd_timeout):
             cmd.linear.x = float(self.latest_request.linear.x)
             cmd.angular.z = float(self.latest_request.angular.z)
 
-        if state == 'STOP':
-            cmd.linear.x = 0.0  # forward/back blocked; rotation still allowed
-        elif state == 'SLOW':
-            cmd.linear.x = max(-self.slow_max, min(self.slow_max, cmd.linear.x))
+        # gate linear motion by the sector it drives into; rotation stays free
+        if cmd.linear.x > 0.0:
+            cmd.linear.x = self._limit(cmd.linear.x, front)
+        elif cmd.linear.x < 0.0:
+            cmd.linear.x = self._limit(cmd.linear.x, rear)
 
         self.cmd_pub.publish(cmd)
 
-        msg = String()
-        msg.data = state if not math.isfinite(d) else f'{state} {d:.2f}'
-        self.state_pub.publish(msg)
+        overall = min(front, rear, left, right)
+        state = 'STOP' if scan_stale else self._zone(overall)
+
+        s = String()
+        if scan_stale:
+            s.data = 'STOP scan_stale'
+        else:
+            s.data = (f'{state} F{front:.2f} R{right:.2f} B{rear:.2f} L{left:.2f}')
+        self.state_pub.publish(s)
 
         if state != self.state:
-            note = 'scan timeout -> holding STOP' if scan_stale else f'obstacle at {d:.2f} m'
-            if state == 'STOP':
-                self.get_logger().error(f'STOP zone: {note}')
-            elif state == 'SLOW':
-                self.get_logger().warn(f'SLOW zone: {note}')
-            elif state == 'WARN':
-                self.get_logger().info(f'WARN zone: {note}')
+            if scan_stale:
+                self.get_logger().error('STOP: scan stale -> holding STOP')
             else:
-                self.get_logger().info('CLEAR')
+                note = f'nearest {overall:.2f} m @ {math.degrees(self.min_bearing):+.0f} deg'
+                if state == 'STOP':
+                    self.get_logger().error(f'STOP: {note}')
+                elif state == 'SLOW':
+                    self.get_logger().warn(f'SLOW: {note}')
+                elif state == 'WARN':
+                    self.get_logger().info(f'WARN: {note}')
+                else:
+                    self.get_logger().info('CLEAR')
             self.state = state
 
 

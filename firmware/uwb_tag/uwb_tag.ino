@@ -18,11 +18,16 @@
  * high. A floating NRST does not work. This mirrors the Pi anchor reset service
  * (scripts/uwb-reset/): assert NRST low ~150 ms, release high, then talk.
  *
- * Wiring - ESP32-WROVER (do NOT use GPIO16/17: PSRAM uses them on WROVER):
- *   ESP32 GPIO25 (RX)  <- RYUW122 TXD
- *   ESP32 GPIO26 (TX)  -> RYUW122 RXD
- *   ESP32 GPIO27       -> RYUW122 NRST   (reset control - REQUIRED)
- *   3V3 -> module VCC (never 5V); common ground; 100uF across VCC-GND.
+ * Wiring - ESP32-WROVER (do NOT use GPIO16/17: PSRAM uses them on WROVER).
+ * RYUW122 header order as silkscreened: GND . PA7 . TXD . RXD . NRST . VDD
+ * (VDD and GND are at OPPOSITE ends - do not assume they are adjacent):
+ *   RYUW122 VDD  -> 3V3 (never 5V)
+ *   RYUW122 GND  -> GND
+ *   RYUW122 TXD  -> ESP32 GPIO25 (ESP RX)
+ *   RYUW122 RXD  -> ESP32 GPIO26 (ESP TX)
+ *   RYUW122 NRST -> ESP32 GPIO27
+ *   RYUW122 PA7  -> leave open
+ *   100uF across VDD-GND; common ground.
  */
 
 #include <Arduino.h>
